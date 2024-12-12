@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  forward-auth:
+    build: .
+    environment:
+      PIPEDRIVE_CLIENT_ID: "${PIPEDRIVE_CLIENT_ID}"
+      PIPEDRIVE_CLIENT_SECRET: "${PIPEDRIVE_CLIENT_SECRET}"
+      SESSION_SECRET: "${SESSION_SECRET}"
+      BASE_URL: "${BASE_URL}"
+      SECURE_COOKIE: "${SECURE_COOKIE}"
+      TRUST_PROXY: "${TRUST_PROXY}"
+      BASE_PATH: "${BASE_PATH}"
+    restart: always
+    volumes:
+      - forward-auth-data:/data
+    ports:
+      - "3000:3000"  # Esponi la porta se necessario
+
+volumes:
+  forward-auth-data:
