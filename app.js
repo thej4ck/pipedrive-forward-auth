@@ -1,322 +1,470 @@
 const express = require('express');
+const session = require('express-session');
 const axios = require('axios');
-const qs = require('qs');
-const basicAuth = require('express-basic-auth');
-const { setTimeout } = require('timers/promises');
+const { URLSearchParams } = require('url');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
+// Variabili di ambiente
 const {
-  MAILUP_CLIENT_ID,
-  MAILUP_CLIENT_SECRET,
-  MAILUP_USERNAME,
-  MAILUP_PASSWORD,
-  WEBHOOK_BASE_PATH = 'webhook/person/detail/',
-  FORWARD_AUTH_URL = 'http://forward-auth:4000',
-  BASIC_AUTH_USER,
-  BASIC_AUTH_PASS,
-  MAX_FIELD_LENGTH = 40
+  PIPEDRIVE_CLIENT_ID,
+  PIPEDRIVE_CLIENT_SECRET,
+  BASE_URL,
+  BASE_PATH = '', // Default a '' se non specificato
+  SESSION_SECRET,
+  SECURE_COOKIE,
+  TRUST_PROXY
 } = process.env;
 
-if (!BASIC_AUTH_USER || !BASIC_AUTH_PASS) {
-  console.error('BASIC_AUTH_USER and BASIC_AUTH_PASS must be set');
-  process.exit(1);
+// Configurazione delle variabili
+const secureCookie = SECURE_COOKIE === 'true';
+const trustProxyValue = parseInt(TRUST_PROXY, 10) || 0;
+const TOKEN_FILE = path.join('/data', 'tokens.json');
+let tokens = {};
+
+// Funzione per caricare i token da file
+function loadTokens() {
+  if (fs.existsSync(TOKEN_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+      tokens = data;
+      console.log("Tokens caricati da file.");
+    } catch (err) {
+      console.error("Impossibile leggere i token da file:", err);
+      tokens = {};
+    }
+  } else {
+    tokens = {};
+  }
 }
 
+// Funzione per salvare i token su file
+function saveTokens() {
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+  console.log("Tokens salvati su file.");
+}
+
+// Carica i token all'avvio
+loadTokens();
+
+console.log("=== Forward Auth Server con state, Basic Auth, persist token ===");
+console.log("PIPEDRIVE_CLIENT_ID:", PIPEDRIVE_CLIENT_ID ? "SET" : "NOT SET");
+console.log("PIPEDRIVE_CLIENT_SECRET:", PIPEDRIVE_CLIENT_SECRET ? "SET" : "NOT SET");
+console.log("BASE_URL:", BASE_URL);
+console.log("BASE_PATH:", BASE_PATH || "/");
+console.log("SESSION_SECRET:", SESSION_SECRET ? "SET" : "NOT SET");
+console.log("SECURE_COOKIE:", secureCookie);
+console.log("TRUST_PROXY:", trustProxyValue);
+
+// Genera REDIRECT_URI dinamicamente
+const redirect_uri = `${BASE_URL}${BASE_PATH}/oauth/callback`;
+
+// Genera installation_url dinamicamente
+const installation_url = `https://oauth.pipedrive.com/oauth/authorize?client_id=${PIPEDRIVE_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirect_uri)}&response_type=code`;
+
+// Inizializza l'app Express principale
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-let mailupAccessToken = '';
-let mailupTokenExpiry = null;
-const messagesCache = {};
+// Imposta il numero di proxy di cui fidarsi
+app.set('trust proxy', trustProxyValue);
 
-const authMiddleware = basicAuth({
-  users: { [BASIC_AUTH_USER]: BASIC_AUTH_PASS },
-  challenge: true,
-  realm: 'Pipedrive-MailUp Integration'
+// Middleware di log per verificare gli headers e req.secure
+app.use((req, res, next) => {
+  console.log('--- Inizio Headers ---');
+  console.log('X-Forwarded-Proto:', req.headers['x-forwarded-proto']);
+  console.log('X-Forwarded-For:', req.headers['x-forwarded-for']);
+  console.log('Host:', req.headers['host']);
+  console.log('Secure:', req.secure);
+  console.log('Protocol:', req.protocol);
+  console.log('Referer:', req.headers['referer']);
+  console.log('--- Fine Headers ---');
+  next();
 });
 
-function log(context, message, data = null) {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] [${context}] ${message}`);
-  if (data) {
-    console.log(JSON.stringify(data, null, 2));
+// Configurazione della sessione
+const sessionOptions = {
+  secret: SESSION_SECRET || 'change_me',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: secureCookie,        // Imposta il cookie come sicuro o no
+    sameSite: 'none',            // Consente cookie cross-site
+    httpOnly: true,              // Cookie non accessibile via JavaScript
+    path: BASE_PATH || '/'       // Imposta il path del cookie su BASE_PATH
   }
+};
+
+app.use(session(sessionOptions));
+
+// Log richieste
+app.use((req, res, next) => {
+  const sessionStatus = (req.session && req.session.user_key && tokens[req.session.user_key]) ? 'AUTHED' : 'NOT AUTHED';
+  const storedToken = (req.session && req.session.user_key && tokens[req.session.user_key]) ? 'YES' : 'NO';
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Session: ${sessionStatus} - StoredToken: ${storedToken}`);
+  next();
+});
+
+// Funzione per generare una stringa casuale
+function generateRandomString(length = 20) {
+  return crypto.randomBytes(length).toString('hex');
 }
 
-function truncateText(text, maxLength = MAX_FIELD_LENGTH) {
-  if (!text) return '';
-  if (text.length <= maxLength) return text;
-  return text.substring(0, maxLength - 3) + '...';
+// Funzione per verificare se la richiesta proviene da Pipedrive
+function isRequestFromPipedrive(req) {
+  const referer = req.get('Referer') || '';
+  return referer.includes('pipedrive.com');
 }
 
-function getTagColor(views, clicks) {
-  if (views === 0 && clicks === 0) return "red";
-  if (views > 0 && clicks === 0) return "yellow";
-  return "blue";
-}
-
-function cleanHtmlContent(html) {
-  let text = html.replace(/<img[^>]*>/g, '')
-                 .replace(/<a[^>]*>(.*?)<\/a>/g, '$1');
-  
-  text = text.replace(/<[^>]*>/g, ' ');
-  
-  text = text.replace(/&nbsp;/g, ' ')
-             .replace(/&amp;/g, '&')
-             .replace(/&lt;/g, '<')
-             .replace(/&gt;/g, '>')
-             .replace(/&quot;/g, '"')
-             .replace(/&#39;/g, "'")
-             .replace(/&rsquo;/g, "'")
-             .replace(/&lsquo;/g, "'")
-             .replace(/&rdquo;/g, '"')
-             .replace(/&ldquo;/g, '"')
-             .replace(/&hellip;/g, '...')
-             .replace(/&mdash;/g, '-')
-             .replace(/&ndash;/g, '-')
-             .replace(/&bull;/g, '•');
-             
-  text = text.replace(/\s+/g, ' ').trim();
-  
-  return truncateText(text);
-}
-
-async function getMailUpAccessToken() {
-  log('MailUp', 'Requesting new access token');
-  const tokenUrl = 'https://services.mailup.com/Authorization/OAuth/Token';
-  const authHeader = Buffer.from(`${MAILUP_CLIENT_ID}:${MAILUP_CLIENT_SECRET}`).toString('base64');
-  
-  try {
-    const response = await axios.post(tokenUrl, 
-      qs.stringify({
-        grant_type: 'password',
-        username: MAILUP_USERNAME,
-        password: MAILUP_PASSWORD,
-      }), {
-        headers: {
-          Authorization: `Basic ${authHeader}`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-      }
-    );
-    
-    mailupAccessToken = response.data.access_token;
-    mailupTokenExpiry = Date.now() + response.data.expires_in * 1000;
-    log('MailUp', 'Access token obtained successfully', { expires_in: response.data.expires_in });
-  } catch (error) {
-    log('MailUp', 'Error getting access token', { error: error.message });
-    throw error;
-  }
-}
-
-async function getMessageDetails(idMessage) {
-  log('MailUp', `Getting message details for ID: ${idMessage}`);
-  
-  if (messagesCache[idMessage]) {
-    log('MailUp', `Cache hit for message ID: ${idMessage}`);
-    return messagesCache[idMessage];
+// Funzione per rinnovare l'access token usando il refresh token
+async function refreshAccessToken(userKey) {
+  const tokenData = tokens[userKey];
+  if (!tokenData || !tokenData.refresh_token) {
+    throw new Error("No refresh_token available");
   }
 
-  if (!mailupAccessToken || Date.now() >= mailupTokenExpiry) {
-    log('MailUp', 'Token expired, refreshing');
-    await getMailUpAccessToken();
-  }
+  console.log("Rinnovo access_token utilizzando refresh_token:", tokenData.refresh_token);
 
-  await setTimeout(200);
+  // Preparazione dell'header Basic Auth
+  const credentials = Buffer.from(`${PIPEDRIVE_CLIENT_ID}:${PIPEDRIVE_CLIENT_SECRET}`).toString('base64');
+
+  const refreshParams = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: tokenData.refresh_token
+  }).toString();
 
   try {
-    const response = await axios.get(
-      `https://services.mailup.com/API/v1.1/Rest/ConsoleService.svc/Console/List/1/Email/${idMessage}`,
-      {
-        headers: { Authorization: `Bearer ${mailupAccessToken}` }
+    const tokenResponse = await axios.post('https://oauth.pipedrive.com/oauth/token', refreshParams, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${credentials}`
       }
-    );
+    });
 
-    const cleanContent = cleanHtmlContent(response.data.Content);
-    
-    messagesCache[idMessage] = {
-      id: idMessage,
-      header: truncateText(response.data.Subject),
-      content: cleanContent
+    console.log("Token response data:", tokenResponse.data);
+
+    const { access_token, refresh_token, expires_in, scope, api_domain } = tokenResponse.data;
+
+    if (!access_token) {
+      throw new Error("No access_token in response");
+    }
+
+    // Aggiorna i token e l'expires_at
+    tokens[userKey] = {
+      access_token,
+      refresh_token,
+      expires_in,
+      scope,
+      api_domain,
+      expires_at: Math.floor(Date.now() / 1000) + expires_in
     };
 
-    log('MailUp', `Message details retrieved for ID: ${idMessage}`, { subject: response.data.Subject });
-    return messagesCache[idMessage];
-  } catch (error) {
-    log('MailUp', `Error getting message details for ID: ${idMessage}`, { error: error.message });
-    throw error;
+    saveTokens();
+    console.log("Access token rinnovato e salvato.");
+
+  } catch (err) {
+    console.error("Errore nel rinnovo del token:", err.response ? err.response.data : err.message);
+    throw err;
   }
 }
 
-async function getEmailStats(email) {
-  log('MailUp', `Getting stats for email: ${email}`);
-
-  if (!mailupAccessToken || Date.now() >= mailupTokenExpiry) {
-    await getMailUpAccessToken();
-  }
-
-  try {
-    const recipientResponse = await axios.get(
-      `https://services.mailup.com/API/v1.1/Rest/ConsoleService.svc/Console/Recipients?email="${encodeURIComponent(email)}"`,
-      {
-        headers: { Authorization: `Bearer ${mailupAccessToken}` }
+// Middleware di autenticazione per le route protette
+async function authenticationMiddleware(req, res, next) {
+  // Se l'utente ha già un token memorizzato nella sessione, passa
+  if (req.session && req.session.user_key && tokens[req.session.user_key] && tokens[req.session.user_key].access_token) {
+    // Controlla se il token è scaduto o sta per scadere entro 5 minuti
+    const tokenData = tokens[req.session.user_key];
+    const currentTime = Math.floor(Date.now() / 1000);
+    if (tokenData.expires_at && (currentTime >= tokenData.expires_at || (tokenData.expires_at - currentTime) <= 300)) {
+      console.log("Access token scaduto o sta per scadere, avvio il refresh del token.");
+      try {
+        await refreshAccessToken(req.session.user_key);
+        next();
+      } catch (err) {
+        console.error("Errore nel refresh del token:", err);
+        // Rimuovi il token non valido
+        delete tokens[req.session.user_key];
+        saveTokens();
+        // Avvia nuovamente il flusso OAuth
+        initiateOAuth(req, res);
       }
-    );
-
-    if (!recipientResponse.data.Items?.length) {
-      log('MailUp', `No recipient found for email: ${email}`);
-      return [];
+      return;
     }
 
-    const recipientId = recipientResponse.data.Items[0].idRecipient;
-    log('MailUp', `Found recipient ID: ${recipientId} for email: ${email}`);
-
-    const [opensResponse, clicksResponse] = await Promise.all([
-      axios.get(
-        `https://services.mailup.com/API/v1.1/Rest/MailStatisticsService.svc/Recipient/${recipientId}/List/Views?orderby="IdMessage+desc"&PageSize=10`,
-        { headers: { Authorization: `Bearer ${mailupAccessToken}` } }
-      ),
-      axios.get(
-        `https://services.mailup.com/API/v1.1/Rest/MailStatisticsService.svc/Recipient/${recipientId}/List/Clicks?orderby="IdMessage+desc"&PageSize=10`,
-        { headers: { Authorization: `Bearer ${mailupAccessToken}` } }
-      )
-    ]);
-
-    const messagesMap = {};
-
-    opensResponse.data.Items.forEach(item => {
-      messagesMap[item.IdMessage] = {
-        id: item.IdMessage,
-        header: truncateText(item.Subject),
-        views: item.Count,
-        clicks: 0
-      };
-    });
-
-    clicksResponse.data.Items.forEach(item => {
-      if (messagesMap[item.IdMessage]) {
-        messagesMap[item.IdMessage].clicks = item.Count;
-      } else {
-        messagesMap[item.IdMessage] = {
-          id: item.IdMessage,
-          header: truncateText(item.Subject),
-          views: 0,
-          clicks: item.Count
-        };
-      }
-    });
-
-    log('MailUp', `Stats retrieved for email: ${email}`, { 
-      messageCount: Object.keys(messagesMap).length,
-      totalViews: Object.values(messagesMap).reduce((sum, msg) => sum + msg.views, 0),
-      totalClicks: Object.values(messagesMap).reduce((sum, msg) => sum + msg.clicks, 0)
-    });
-
-    return Object.values(messagesMap);
-  } catch (error) {
-    log('MailUp', `Error getting stats for email: ${email}`, { error: error.message });
-    throw error;
+    console.log("Token presente e valido per l'utente in sessione, skip autorizzazione.");
+    return next();
   }
+
+  // Utente non autenticato, inizia il flusso OAuth
+  console.log("Utente non autenticato, genero state e reindirizzo a Pipedrive per il login");
+  initiateOAuth(req, res);
 }
 
-app.get(`/${WEBHOOK_BASE_PATH}`, authMiddleware, async (req, res) => {
-  const requestId = Math.random().toString(36).substring(7);
-  log('Webhook', `Received request ${requestId}`, req.query);
+// Funzione per avviare il flusso OAuth
+function initiateOAuth(req, res) {
+  const state = generateRandomString();
+  if (req.session) {
+    req.session.oauth_state = state;
+  }
+
+  const authorizeUrl = `https://oauth.pipedrive.com/oauth/authorize?client_id=${PIPEDRIVE_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirect_uri)}&response_type=code&state=${state}`;
+  console.log("Redirecting to:", authorizeUrl);
+  res.redirect(authorizeUrl);
+}
+
+// Definisci le route
+
+// GET /oauth/login
+app.get(`${BASE_PATH}/oauth/login`, (req, res) => {
+  initiateOAuth(req, res);
+});
+
+// Gestione della callback OAuth2
+app.get(`${BASE_PATH}/oauth/callback`, async (req, res) => {
+  const { code, state, error } = req.query;
+  console.log("Ricevuto callback da Pipedrive. Code:", code, "State:", state, "Error:", error);
+
+  // Se l'utente ha negato l'autorizzazione
+  if (error === 'user_denied') {
+    console.error("L'utente ha negato l'installazione dell'app.");
+    return res.status(400).send("L'utente ha negato l'autorizzazione.");
+  }
+
+  // Se la richiesta proviene da Pipedrive, ignorare il controllo dello state
+  if (!state && isRequestFromPipedrive(req)) {
+    console.warn("State mancante ma richiesta proveniente da Pipedrive. Procedo senza validazione dello state.");
+  } else {
+    const sessionState = req.session && req.session.oauth_state;
+    if (!state || state !== sessionState) {
+      console.error("State non corrispondente! Possibile CSRF.");
+      return res.status(400).send("State does not match!");
+    }
+    // Se lo state corrisponde, puoi cancellarlo dalla sessione
+    if (req.session) {
+      delete req.session.oauth_state;
+    }
+  }
+
+  if (!code) {
+    console.error("Nessun code presente nel callback");
+    return res.status(400).send("Code missing");
+  }
+
+  console.log("Scambio code con access_token e refresh_token tramite Basic Auth...");
+
+  // Preparazione dell'header Basic Auth
+  const credentials = Buffer.from(`${PIPEDRIVE_CLIENT_ID}:${PIPEDRIVE_CLIENT_SECRET}`).toString('base64');
 
   try {
-    const { resource, view, userId, companyId, selectedIds } = req.query;
-
-    if (resource !== 'person' || view !== 'details') {
-      log('Webhook', `Invalid request type ${requestId}`, { resource, view });
-      return res.status(400).json({ error: 'Invalid request type' });
-    }
-
-    log('Pipedrive', `Getting token for user ${userId} company ${companyId}`);
-    const tokenResponse = await axios.get(`${FORWARD_AUTH_URL}/token/${userId}/${companyId}`);
-    log('Pipedrive', 'Token response:', tokenResponse.data);
-
-    const userKey = `${companyId}_${userId}`;
-    const tokenData = tokenResponse.data;
-    
-    if (!tokenData || !tokenData.access_token || !tokenData.api_domain) {
-      log('Pipedrive', 'Invalid token data', tokenData);
-      return res.status(500).json({ error: 'Invalid token data' });
-    }
-
-    const { access_token, api_domain } = tokenData;
-    log('Pipedrive', 'Token data extracted', { api_domain });
-
-    log('Pipedrive', `Getting person details for ID: ${selectedIds}`);
-    const personResponse = await axios.get(`${api_domain}/api/v2/persons/${selectedIds}`, {
-      headers: { Authorization: `Bearer ${access_token}` }
-    });
-
-    const emails = personResponse.data.data.emails
-      .map(email => email.value)
-      .filter(Boolean);
-
-    log('Pipedrive', `Found ${emails.length} emails for person ${selectedIds}`, { emails });
-
-    if (!emails.length) {
-      log('Webhook', `No emails found for request ${requestId}`);
-      return res.json({ data: [] });
-    }
-
-    const allStats = await Promise.all(emails.map(getEmailStats));
-    const mergedStats = allStats.flat().reduce((acc, stat) => {
-      const existing = acc.find(s => s.id === stat.id);
-      if (existing) {
-        existing.views += stat.views;
-        existing.clicks += stat.clicks;
-      } else {
-        acc.push(stat);
+    const tokenResponse = await axios.post('https://oauth.pipedrive.com/oauth/token', new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri
+    }).toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${credentials}`
       }
-      return acc;
-    }, []);
-
-    const sortedStats = mergedStats
-      .sort((a, b) => b.id - a.id)
-      .slice(0, 10);
-
-    log('Webhook', `Processing ${sortedStats.length} messages for request ${requestId}`);
-
-    const finalStats = await Promise.all(
-      sortedStats.map(async stat => {
-        const details = await getMessageDetails(stat.id);
-        return {
-          id: stat.id,
-          header: truncateText(details.header),
-          title: truncateText(details.header),
-          views: stat.views,
-          clicks: stat.clicks,
-          tag: {
-            color: getTagColor(stat.views, stat.clicks),
-            label: `V${stat.views}C${stat.clicks}`
-          },
-          Anteprima: {
-            markdown: true,
-            value: details.content
-          }
-        };
-      })
-    );
-
-    log('Webhook', `Request ${requestId} completed successfully`, { 
-      messageCount: finalStats.length,
-      messageIds: finalStats.map(stat => stat.id)
     });
 
-    res.json({ data: finalStats });
-  } catch (error) {
-    log('Webhook', `Error processing request ${requestId}`, { 
-      error: error.message,
-      stack: error.stack
+    console.log("tokenResponse.data:", tokenResponse.data);
+    const { access_token, refresh_token, expires_in, scope, api_domain } = tokenResponse.data;
+    console.log("Access token ricevuto:", access_token ? "OK" : "NO TOKEN");
+
+    if (!access_token) {
+      console.error("Nessun access_token nella risposta");
+      return res.status(500).send("Errore nell'ottenere l'access token");
+    }
+
+    // Estrarre company_id e user_id dal refresh_token
+    const refreshTokenParts = refresh_token.split(':');
+    if (refreshTokenParts.length < 2) {
+      console.error("Refresh token non contiene company_id e user_id");
+      return res.status(500).send("Invalid refresh token format");
+    }
+
+    const company_id = refreshTokenParts[0];
+    const user_id = refreshTokenParts[1];
+    const userKey = `${company_id}_${user_id}`;
+
+    // Salva i token sotto la chiave unica
+    tokens[userKey] = {
+      access_token,
+      refresh_token,
+      expires_in,
+      scope,
+      api_domain,
+      expires_at: Math.floor(Date.now() / 1000) + expires_in
+    };
+    saveTokens();
+
+    // Salva l'utente nella sessione
+    if (req.session) {
+      req.session.user_key = userKey;
+      req.session.access_token = access_token;
+    }
+
+    req.session.save(err => {
+      if (err) {
+        console.error("Errore nel salvataggio della sessione:", err);
+        return res.status(500).send("Errore nel salvataggio della sessione");
+      }
+      console.log("Sessione aggiornata, token salvato, redirect a BASE_URL:", BASE_URL);
+      res.redirect(BASE_URL);
     });
-    res.status(500).json({ error: 'Internal server error' });
+  } catch (err) {
+    console.error("Errore nello scambio del token:", err.response ? err.response.data : err.message || err);
+    res.status(500).send("Errore nello scambio del token");
   }
 });
 
-app.listen(PORT, () => {
-  log('Server', `Running on port ${PORT}`);
-  log('Server', `Webhook path: /${WEBHOOK_BASE_PATH}`);
-  log('Server', `Maximum field length: ${MAX_FIELD_LENGTH} characters`);
+// Gestione del webhook di Uninstall da Pipedrive
+app.delete(`${BASE_PATH}/oauth/callback`, express.json(), async (req, res) => {
+  const authHeader = req.headers['authorization'] || '';
+  const expectedAuth = 'Basic ' + Buffer.from(`${PIPEDRIVE_CLIENT_ID}:${PIPEDRIVE_CLIENT_SECRET}`).toString('base64');
+
+  if (authHeader !== expectedAuth) {
+    console.error("Invalid Authorization header");
+    return res.status(401).send("Unauthorized");
+  }
+
+  const { client_id, company_id, user_id, timestamp } = req.body;
+
+  if (client_id !== PIPEDRIVE_CLIENT_ID) {
+    console.error("Invalid client_id in uninstall webhook");
+    return res.status(400).send("Invalid client_id");
+  }
+
+  console.log(`Received uninstall webhook from Pipedrive for company_id: ${company_id}, user_id: ${user_id} at ${timestamp}`);
+
+  const userKey = `${company_id}_${user_id}`;
+  if (!tokens[userKey]) {
+    console.warn("No tokens found for this user/company to revoke");
+    return res.status(200).send("No tokens to revoke");
+  }
+
+  const { refresh_token } = tokens[userKey];
+
+  if (!refresh_token) {
+    console.warn("No refresh_token found to revoke");
+    return res.status(200).send("No refresh_token to revoke");
+  }
+
+  // Revoca il refresh_token
+  const revokeParams = new URLSearchParams({
+    token: refresh_token,
+    token_type_hint: 'refresh_token'
+  }).toString();
+
+  const credentials = Buffer.from(`${PIPEDRIVE_CLIENT_ID}:${PIPEDRIVE_CLIENT_SECRET}`).toString('base64');
+
+  try {
+    const revokeResponse = await axios.post('https://oauth.pipedrive.com/oauth/revoke', revokeParams, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${credentials}`
+      }
+    });
+
+    console.log("Refresh token revoked:", revokeResponse.status);
+
+    // Elimina il token dal file e dall'oggetto
+    delete tokens[userKey];
+    saveTokens();
+
+    res.status(200).send("Uninstalled and tokens revoked");
+  } catch (error) {
+    console.error("Error revoking token:", error.response ? error.response.data : error.message);
+    res.status(500).send("Error revoking token");
+  }
+});
+
+// Route di test per verificare req.secure
+app.get(`${BASE_PATH}/test-secure`, (req, res) => {
+  res.send(`Secure: ${req.secure}, Protocol: ${req.protocol}`);
+});
+
+// Route di test per verificare l'impostazione dei cookie
+app.get(`${BASE_PATH}/test-cookie`, (req, res) => {
+  res.cookie('testcookie', 'testvalue', { secure: secureCookie, sameSite: 'none', path: BASE_PATH || '/' });
+  res.send('Cookie di test impostato.');
+});
+
+// Route per la home
+app.get(`${BASE_PATH}/`, (req, res) => {
+  if (req.session && req.session.user_key && tokens[req.session.user_key] && tokens[req.session.user_key].access_token) {
+    res.send('ok');
+  } else {
+    res.redirect(`${BASE_PATH}/oauth/login`);
+  }
+});
+
+// Route protette (esempio)
+app.get(`${BASE_PATH}/protected/dashboard`, authenticationMiddleware, (req, res) => {
+  res.send('Benvenuto nel dashboard protetto!');
+});
+
+// 404 handler
+app.use((req, res, next) => {
+  res.status(404).send('Not Found');
+});
+
+// Log all the necessary URLs at start
+console.log(`Callback URL to set in Pipedrive: ${redirect_uri}`);
+console.log(`Installation URL to set in Pipedrive: ${installation_url}`);
+
+// Avvia il server principale
+app.listen(3000, () => console.log('Forward Auth server avviato sulla porta 3000'));
+
+// ===============================
+// Nuovo Servizio per Fornire Token
+// ===============================
+
+// Configura una nuova porta per il servizio dei token
+const TOKEN_SERVICE_PORT = 4000;
+
+// Inizializza una nuova app Express per il servizio dei token
+const tokenApp = express();
+
+// Middleware per log delle richieste al servizio dei token
+tokenApp.use((req, res, next) => {
+  console.log(`[Token Service] ${req.method} ${req.url}`);
+  next();
+});
+
+// Definisci la route GET /token/:userId/:companyId
+tokenApp.get('/token/:userId/:companyId', async (req, res) => {
+  const { userId, companyId } = req.params;
+  const userKey = `${companyId}_${userId}`;
+
+  if (!tokens[userKey] || !tokens[userKey].access_token) {
+    console.error(`[Token Service] Token non trovato per userKey: ${userKey}`);
+    return res.status(404).json({ error: "Token not found" });
+  }
+
+  const tokenData = tokens[userKey];
+  const currentTime = Math.floor(Date.now() / 1000);
+
+  // Verifica se il token è scaduto o sta per scadere entro 5 minuti (300 secondi)
+  if (tokenData.expires_at && (currentTime >= tokenData.expires_at || (tokenData.expires_at - currentTime) <= 300)) {
+    console.log(`[Token Service] Token per userKey ${userKey} è scaduto o sta per scadere. Rinnovo in corso...`);
+    try {
+      await refreshAccessToken(userKey);
+    } catch (err) {
+      console.error(`[Token Service] Errore nel rinnovo del token per userKey ${userKey}:`, err.message);
+      return res.status(500).json({ error: "Failed to refresh token" });
+    }
+  }
+
+  // Restituisci il token aggiornato
+  res.json({
+    access_token: tokens[userKey].access_token,
+    api_domain: tokens[userKey].api_domain,
+    expires_at: tokens[userKey].expires_at
+  });
+});
+
+// Avvia il servizio dei token su TOKEN_SERVICE_PORT
+tokenApp.listen(TOKEN_SERVICE_PORT, () => {
+  console.log(`Token Service avviato sulla porta ${TOKEN_SERVICE_PORT}`);
 });
