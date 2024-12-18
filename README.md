@@ -41,7 +41,7 @@ Apri il file `.env` e inserisci le tue variabili:
 PIPEDRIVE_CLIENT_ID=your_pipedrive_client_id
 PIPEDRIVE_CLIENT_SECRET=your_pipedrive_client_secret
 SESSION_SECRET=your_session_secret
-BASE_URL=https://lxp.scao.it
+BASE_URL=https://pippo.it
 SECURE_COOKIE=true
 TRUST_PROXY=2
 BASE_PATH=/pipedrive-oauth
